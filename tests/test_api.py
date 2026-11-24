@@ -429,3 +429,243 @@ def test_duplicate_car_day_conflict_rolls_back(client):
     data = _query(c, "W1", "2026-09-02").json()
     assert data["known_meters"] == 3  # 1 + 2
     assert data["mileage_complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# 整批更正：互换车厢/日期、腾位补报、真实冲突、顺序无关
+# ---------------------------------------------------------------------------
+
+
+def _mileage_state(db_path: str):
+    with sqlite3.connect(db_path) as raw:
+        raw.row_factory = sqlite3.Row
+        days = [
+            (r["record_no"], r["car_id"], r["day"], r["meters"])
+            for r in raw.execute(
+                "SELECT record_no, car_id, day, meters "
+                "FROM car_daily_mileage ORDER BY record_no"
+            )
+        ]
+        serving = [
+            (r["car_id"], r["day"], r["meters"])
+            for r in raw.execute(
+                "SELECT car_id, day, meters FROM car_mileage_day_serving "
+                "ORDER BY car_id, day"
+            )
+        ]
+        blocks = [
+            (r["car_id"], r["start_day"], r["end_day"])
+            for r in raw.execute(
+                "SELECT car_id, start_day, end_day FROM car_mileage_block "
+                "ORDER BY car_id, start_day"
+            )
+        ]
+    return days, serving, blocks
+
+
+def _seed_two_records(c):
+    """C1 01-01 100 米、C2 01-02 200 米，同轮对 W1 的两段装车。"""
+    r = _batch(
+        c,
+        overhauls=[{"record_no": "OH-1", "wheelset_id": "W1", "overhaul_day": "2026-01-01"}],
+        mounts=[
+            {"record_no": "M-1", "wheelset_id": "W1", "car_id": "C1",
+             "start_day": "2026-01-01", "end_day": "2026-01-02"},
+            {"record_no": "M-2", "wheelset_id": "W1", "car_id": "C2",
+             "start_day": "2026-01-02", "end_day": "2026-01-04"},
+        ],
+        mileage=[
+            {"record_no": "D-1", "car_id": "C1", "day": "2026-01-01", "meters": 100},
+            {"record_no": "D-2", "car_id": "C2", "day": "2026-01-02", "meters": 200},
+        ],
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_swap_car_and_day_between_two_records(client):
+    """两条记录互换车厢与日期，同批报送应成功且顺序无关。"""
+    c, db_path = client
+    _seed_two_records(c)
+
+    r = _batch(
+        c,
+        mileage=[
+            {"record_no": "D-1", "car_id": "C2", "day": "2026-01-02", "meters": 111},
+            {"record_no": "D-2", "car_id": "C1", "day": "2026-01-01", "meters": 222},
+        ],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["inserted"]["mileage"] == 0
+    assert body["corrected"]["mileage"] == 2
+    assert body["corrected_record_nos"]["mileage"] == ["D-1", "D-2"]
+    # 互换后回执仍按 record_no 是否已存在区分（两条都是更正）
+    assert body["inserted_record_nos"]["mileage"] == []
+
+    days, serving, blocks = _mileage_state(db_path)
+    assert days == [
+        ("D-1", "C2", "2026-01-02", 111),
+        ("D-2", "C1", "2026-01-01", 222),
+    ]
+    assert serving == [
+        ("C1", "2026-01-01", 222),
+        ("C2", "2026-01-02", 111),
+    ]
+    assert blocks == [
+        ("C1", "2026-01-01", "2026-01-02"),
+        ("C2", "2026-01-02", "2026-01-03"),
+    ]
+
+    data = _query(c, "W1", "2026-01-02").json()
+    assert data["known_meters"] == 333
+    assert data["mileage_complete"] is True
+
+    # 反向再换回来，结果同样应成功
+    r = _batch(
+        c,
+        mileage=[
+            {"record_no": "D-1", "car_id": "C1", "day": "2026-01-01", "meters": 100},
+            {"record_no": "D-2", "car_id": "C2", "day": "2026-01-02", "meters": 200},
+        ],
+    )
+    assert r.status_code == 200, r.text
+    assert _query(c, "W1", "2026-01-02").json()["known_meters"] == 300
+
+
+def test_swap_order_does_not_matter(client):
+    """同一组互换，调换批内顺序得到完全相同的入库结果。"""
+    c, db_path = client
+    _seed_two_records(c)
+    fwd = [
+        {"record_no": "D-1", "car_id": "C2", "day": "2026-01-02", "meters": 111},
+        {"record_no": "D-2", "car_id": "C1", "day": "2026-01-01", "meters": 222},
+    ]
+    r = _batch(c, mileage=fwd)
+    assert r.status_code == 200, r.text
+    first = _mileage_state(db_path)
+
+    # 还原后按相反顺序再换一次
+    assert _batch(c, mileage=[
+        {"record_no": "D-1", "car_id": "C1", "day": "2026-01-01", "meters": 100},
+        {"record_no": "D-2", "car_id": "C2", "day": "2026-01-02", "meters": 200},
+    ]).status_code == 200
+    r = _batch(c, mileage=list(reversed(fwd)))
+    assert r.status_code == 200, r.text
+    assert _mileage_state(db_path) == first
+
+
+def test_backfill_freed_car_day_in_same_batch(client):
+    """同批里刚被更正腾出的车厢日，可用新记录号补报，不受顺序影响。"""
+    c, db_path = client
+    _seed_two_records(c)
+
+    # D-1 从 C1/01-01 挪到 C1/01-03，腾出 C1/01-01 由新记录 D-9 接手
+    r = _batch(
+        c,
+        mileage=[
+            {"record_no": "D-9", "car_id": "C1", "day": "2026-01-01", "meters": 555},
+            {"record_no": "D-1", "car_id": "C1", "day": "2026-01-03", "meters": 100},
+        ],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["inserted"]["mileage"] == 1
+    assert body["inserted_record_nos"]["mileage"] == ["D-9"]
+    assert body["corrected"]["mileage"] == 1
+    assert body["corrected_record_nos"]["mileage"] == ["D-1"]
+
+    days, serving, blocks = _mileage_state(db_path)
+    assert ("D-1", "C1", "2026-01-03", 100) in days
+    assert ("D-9", "C1", "2026-01-01", 555) in days
+    assert serving == [
+        ("C1", "2026-01-01", 555),
+        ("C1", "2026-01-03", 100),
+        ("C2", "2026-01-02", 200),
+    ]
+    assert blocks == [
+        ("C1", "2026-01-01", "2026-01-02"),
+        ("C1", "2026-01-03", "2026-01-04"),
+        ("C2", "2026-01-02", "2026-01-03"),
+    ]
+    # 01-03 在装车段外，但 01-01、01-02 仍完整
+    assert _query(c, "W1", "2026-01-02").json()["known_meters"] == 755
+
+    # 同一腾位场景，改为先报更正、后报补报，结果应一致
+    r = _batch(c, mileage=[
+        {"record_no": "D-1", "car_id": "C2", "day": "2026-01-02", "meters": 100},
+        {"record_no": "D-9", "car_id": "C1", "day": "2026-01-01", "meters": 555},
+    ])
+    assert r.status_code == 409, r.text  # D-2 仍占 C2/01-02，真实冲突
+    # 先把 D-2 腾出 C2/01-02，再由新记录补报刚空出的位置
+    assert _batch(c, mileage=[
+        {"record_no": "D-2", "car_id": "C2", "day": "2026-01-03", "meters": 200},
+        {"record_no": "D-9", "car_id": "C2", "day": "2026-01-02", "meters": 777},
+    ]).status_code == 200
+    assert _mileage_state(db_path)[1] == [
+        ("C1", "2026-01-03", 100),
+        ("C2", "2026-01-02", 777),
+        ("C2", "2026-01-03", 200),
+    ]
+
+
+def test_real_conflict_whole_batch_rolls_back_and_old_result_queryable(client):
+    """同批两条最终占同一车厢-日：整批退回，仍可查到上次提交的结果。"""
+    c, db_path = client
+    _seed_two_records(c)
+    before = _mileage_state(db_path)
+
+    # D-1 改到 C2/01-02（D-2 仍占），同批还带一条与本次无关的更正 D-2
+    r = _batch(
+        c,
+        mileage=[
+            {"record_no": "D-1", "car_id": "C2", "day": "2026-01-02", "meters": 999},
+            {"record_no": "D-2", "car_id": "C2", "day": "2026-01-02", "meters": 999},
+        ],
+    )
+    assert r.status_code == 409, r.text
+    assert "整批退回" in r.json()["detail"]
+    # 批内改动全部回滚，连无关的正确更正也没生效
+    assert _mileage_state(db_path) == before
+
+    data = _query(c, "W1", "2026-01-02").json()
+    assert data["known_meters"] == 300
+    assert data["mileage_complete"] is True
+
+    # 与批外已有记录撞同一车厢-日，同样整批退回
+    r = _batch(c, mileage=[
+        {"record_no": "D-9", "car_id": "C2", "day": "2026-01-02", "meters": 1},
+    ])
+    assert r.status_code == 409
+    assert _mileage_state(db_path) == before
+
+
+def test_correction_to_zero_meter_counts_as_reported(client):
+    """更正后的零米日算已报，缺报段随之消失；查询同时反映米数与连续段。"""
+    c, _ = client
+    _batch(
+        c,
+        overhauls=[{"record_no": "OH-1", "wheelset_id": "W1", "overhaul_day": "2026-12-01"}],
+        mounts=[{"record_no": "M-1", "wheelset_id": "W1", "car_id": "C1",
+                 "start_day": "2026-12-01", "end_day": "2026-12-04"}],
+        mileage=[{"record_no": "D-1", "car_id": "C1", "day": "2026-12-01",
+                  "meters": 10}],
+    )
+    data = _query(c, "W1", "2026-12-03").json()
+    assert data["known_meters"] == 10
+    assert data["missing_ranges"]["C1"] == [
+        {"start_day": "2026-12-02", "end_day": "2026-12-04", "days": 2},
+    ]
+
+    # 把 D-1 更正为零米，再用新记录补报 12-02、12-03（零米同样算已报）
+    r = _batch(c, mileage=[
+        {"record_no": "D-1", "car_id": "C1", "day": "2026-12-01", "meters": 0},
+        {"record_no": "D-2", "car_id": "C1", "day": "2026-12-02", "meters": 0},
+        {"record_no": "D-3", "car_id": "C1", "day": "2026-12-03", "meters": 0},
+    ])
+    assert r.status_code == 200, r.text
+
+    data = _query(c, "W1", "2026-12-03").json()
+    assert data["known_meters"] == 0
+    assert data["mileage_complete"] is True
+    assert data["is_lower_bound"] is False
+    assert data["missing_ranges"] == {}

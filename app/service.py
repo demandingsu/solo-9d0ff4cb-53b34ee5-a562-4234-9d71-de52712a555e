@@ -114,36 +114,89 @@ def _block_remove_day(conn: sqlite3.Connection, car_id: str, day: str) -> None:
         )
 
 
-def _serving_upsert(
-    conn: sqlite3.Connection,
-    old_car: str | None,
-    old_day: str | None,
-    new_car: str,
-    new_day: str,
-    meters: int,
-) -> None:
-    """同步服务层日表与连续块，支持更正（含换车厢、换日）。"""
-    if old_car is not None and (old_car, old_day) != (new_car, new_day):
-        conn.execute(
-            "DELETE FROM car_mileage_day_serving WHERE car_id = ? AND day = ?",
-            (old_car, old_day),
-        )
-        _block_remove_day(conn, old_car, old_day)
+def _chunks(items: list, size: int = 500):
+    """SQLite 单语句参数个数有限，按固定大小切块。"""
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
-    conn.execute(
-        "INSERT INTO car_mileage_day_serving (car_id, day, meters) VALUES (?, ?, ?) "
-        "ON CONFLICT(car_id, day) DO UPDATE SET meters = excluded.meters",
-        (new_car, new_day, meters),
-    )
-    if old_car is None or (old_car, old_day) != (new_car, new_day):
-        # 同日同车厢更正只改米数，块不动；否则新日入块
-        covered = conn.execute(
-            "SELECT 1 FROM car_mileage_block "
-            "WHERE car_id = ? AND start_day <= ? AND end_day > ?",
-            (new_car, new_day, new_day),
-        ).fetchone()
-        if not covered:
-            _block_add_day(conn, new_car, new_day)
+
+def _load_mileage_rows(
+    conn: sqlite3.Connection, record_nos: list[str]
+) -> dict[str, tuple[str, str, int]]:
+    """只取本批记录号对应的改动前车厢日明细。"""
+    rows: dict[str, tuple[str, str, int]] = {}
+    for chunk in _chunks(record_nos):
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            "SELECT record_no, car_id, day, meters FROM car_daily_mileage "
+            f"WHERE record_no IN ({placeholders})",
+            tuple(chunk),
+        ):
+            rows[row["record_no"]] = (row["car_id"], row["day"], row["meters"])
+    return rows
+
+
+def _reconcile_serving(
+    conn: sqlite3.Connection,
+    old_rows: dict[str, tuple[str, str, int]],
+    final_rows: dict[str, tuple[str, str, int]],
+) -> None:
+    """按批次前后差异维护服务层，只触碰涉及的车厢日。
+
+    - 以整批更正后的最终占用为准写入日表；
+    - 某车厢日从“未报”变“已报”时并入连续块，反之从块中摘除；
+    - 车厢日仍已报、仅米数变化时不改连续块（零米同样是已报）。
+    """
+    affected: dict[str, set[str]] = {}
+    for car_id, day, _ in old_rows.values():
+        affected.setdefault(car_id, set()).add(day)
+    for car_id, day, _ in final_rows.values():
+        affected.setdefault(car_id, set()).add(day)
+    if not affected:
+        return
+
+    # 仅查询本批改动涉及的车厢日，判断更正前是否已报
+    reported_before: set[tuple[str, str]] = set()
+    for car_id, days in affected.items():
+        for chunk in _chunks(sorted(days)):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                "SELECT day FROM car_mileage_day_serving "
+                f"WHERE car_id = ? AND day IN ({placeholders})",
+                (car_id, *chunk),
+            ):
+                reported_before.add((car_id, row["day"]))
+
+    final_by_pair = {(car_id, day): meters for car_id, day, meters in final_rows.values()}
+
+    for car_id, days in affected.items():
+        for day in sorted(days):
+            pair = (car_id, day)
+            final_meters = final_by_pair.get(pair)
+            was_reported = pair in reported_before
+
+            if final_meters is not None:
+                conn.execute(
+                    "INSERT INTO car_mileage_day_serving (car_id, day, meters) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(car_id, day) DO UPDATE SET meters = excluded.meters",
+                    (car_id, day, final_meters),
+                )
+                if not was_reported:
+                    covered = conn.execute(
+                        "SELECT 1 FROM car_mileage_block "
+                        "WHERE car_id = ? AND start_day <= ? AND end_day > ?",
+                        (car_id, day, day),
+                    ).fetchone()
+                    if not covered:
+                        _block_add_day(conn, car_id, day)
+            else:
+                conn.execute(
+                    "DELETE FROM car_mileage_day_serving WHERE car_id = ? AND day = ?",
+                    (car_id, day),
+                )
+                if was_reported:
+                    _block_remove_day(conn, car_id, day)
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +212,46 @@ def _empty_record_lists() -> dict[str, list[str]]:
     return {"mileage": [], "mounts": [], "overhauls": []}
 
 
+def _find_car_day_conflicts(
+    conn: sqlite3.Connection,
+    final_rows: dict[str, tuple[str, str, int]],
+    batch_record_nos: set[str],
+) -> None:
+    """按整批更正后的最终占用判重，与报送顺序无关。
+
+    1) 批内两条不同记录号落到同一车厢-日 → 冲突；
+    2) 与批外已有记录落到同一车厢-日 → 冲突（本批自己腾出的旧位置不算）。
+    """
+    by_pair: dict[tuple[str, str], str] = {}
+    for record_no, (car_id, day, _) in final_rows.items():
+        pair = (car_id, day)
+        other = by_pair.get(pair)
+        if other is not None:
+            raise ConflictError(
+                f"记录 {other} 与 {record_no} 最终指向同一车厢-日 "
+                f"{car_id} {day}，整批退回"
+            )
+        by_pair[pair] = record_no
+
+    pairs_by_car: dict[str, list[str]] = {}
+    for car_id, day in by_pair:
+        pairs_by_car.setdefault(car_id, []).append(day)
+
+    for car_id, days in pairs_by_car.items():
+        for chunk in _chunks(sorted(days)):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                "SELECT record_no, day FROM car_daily_mileage "
+                f"WHERE car_id = ? AND day IN ({placeholders})",
+                (car_id, *chunk),
+            ):
+                if row["record_no"] not in batch_record_nos:
+                    raise ConflictError(
+                        f"车厢-日 {car_id} {row['day']} 已由记录 "
+                        f"{row['record_no']} 占用，本批另有记录指向该日，整批退回"
+                    )
+
+
 def ingest_batch(conn: sqlite3.Connection, req: BatchIngestRequest) -> dict:
     inserted = _empty_counter()
     corrected = _empty_counter()
@@ -171,29 +264,38 @@ def ingest_batch(conn: sqlite3.Connection, req: BatchIngestRequest) -> dict:
     }
 
     try:
-        # 1) 车厢日里程：原始表 upsert + 服务层同步
-        for rec in req.mileage:
-            old = conn.execute(
-                "SELECT car_id, day FROM car_daily_mileage WHERE record_no = ?",
-                (rec.record_no,),
-            ).fetchone()
-            existed = old is not None
+        # 先取写锁，保证“读批前状态 → 判重 → 写库”在同一快照内完成
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+
+        # 1) 车厢日里程：先取批前明细，按“整批更正后”的最终占用写库并判重，
+        #    再按前后差异维护服务层。调换报送顺序结果一致。
+        batch_record_nos = [rec.record_no for rec in req.mileage]
+        old_rows = _load_mileage_rows(conn, batch_record_nos)
+        final_rows = {
+            rec.record_no: (rec.car_id, rec.day, rec.meters) for rec in req.mileage
+        }
+
+        _find_car_day_conflicts(conn, final_rows, set(batch_record_nos))
+
+        # 先摘除本批记录旧位置，避免互换车厢/日期时误撞旧唯一约束；
+        # 本批最终仍占用同一位置的记录随后统一写回。
+        for chunk in _chunks(list(final_rows)):
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM car_daily_mileage WHERE record_no IN ({placeholders})",
+                tuple(chunk),
+            )
+        for record_no, (car_id, day, meters) in final_rows.items():
             conn.execute(
                 "INSERT INTO car_daily_mileage (record_no, car_id, day, meters) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(record_no) DO UPDATE SET "
-                "car_id = excluded.car_id, day = excluded.day, meters = excluded.meters",
-                (rec.record_no, rec.car_id, rec.day, rec.meters),
+                "VALUES (?, ?, ?, ?)",
+                (record_no, car_id, day, meters),
             )
-            _serving_upsert(
-                conn,
-                old["car_id"] if old else None,
-                old["day"] if old else None,
-                rec.car_id,
-                rec.day,
-                rec.meters,
-            )
-            if existed:
+        _reconcile_serving(conn, old_rows, final_rows)
+
+        for rec in req.mileage:
+            if rec.record_no in old_rows:
                 corrected["mileage"] += 1
                 corrected_nos["mileage"].append(rec.record_no)
             else:
